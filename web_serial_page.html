@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  web_serial_page.html
+  ----------------------------------------------------------------------------
+  Companion phone page for the Hybrid Reverse Cache.
+
+  Open this page in Chrome on Android (Web Serial requires Chrome/Chromium
+  and a secure context — either https:// hosting or file:// also works on
+  desktop Chrome for testing, though Android Chrome generally wants https
+  or the chrome://flags "Insecure origins treated as secure" override for
+  file:// — easiest is to host it, e.g. via GitHub Pages, or a simple local
+  web server, at an https URL).
+
+  Flow:
+    1. Plug the phone into the ESP32 via USB-C/micro-USB (OTG, data-capable
+       cable).
+    2. Open this page, tap "Connect to Device", pick the ESP32 from the
+       browser's serial port chooser.
+    3. Tap "Send My Location" - the page reads GPS via the Geolocation API
+       and sends "GPS,<lat>,<lon>\n" to the ESP32.
+    4. The ESP32 replies with the distance result, shown here too.
+
+  PROTOCOL (must match processPhoneSerial() in the .ino):
+    Phone -> ESP32:  GPS,<lat>,<lon>\n
+    ESP32 -> Phone:  READY\n
+                     DIST,<meters>,<attemptsLeft>\n
+                     NEARBY,<meters>,<attemptsLeft>\n
+                     NOATTEMPTS\n
+  ============================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hybrid Reverse Cache - Phone Link</title>
+<style>
+  :root {
+    --bg: #0b1410;
+    --panel: #142019;
+    --accent: #2fd673;
+    --accent-dim: #1a7a45;
+    --text: #e8f5ee;
+    --muted: #7a9588;
+    --danger: #e05656;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Roboto, "Segoe UI", sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px 48px;
+  }
+  h1 {
+    font-size: 1.3rem;
+    letter-spacing: 0.5px;
+    margin: 8px 0 2px;
+    text-align: center;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-bottom: 24px;
+    text-align: center;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid #1f2e26;
+    border-radius: 16px;
+    padding: 20px;
+    width: 100%;
+    max-width: 380px;
+    margin-bottom: 16px;
+  }
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--danger);
+    flex-shrink: 0;
+  }
+  .dot.connected { background: var(--accent); }
+  button {
+    width: 100%;
+    padding: 16px;
+    border-radius: 12px;
+    border: none;
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 12px;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  button:active { transform: scale(0.98); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #04130a; }
+  .btn-secondary { background: #1f2e26; color: var(--text); border: 1px solid #2a3d31; }
+  .result {
+    background: #0c1812;
+    border-radius: 12px;
+    padding: 18px;
+    text-align: center;
+    margin-top: 6px;
+  }
+  .result .distance {
+    font-size: 2rem;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .result .attempts {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-top: 6px;
+  }
+  .result.nearby .distance { color: #ffd75e; }
+  .log {
+    width: 100%;
+    max-width: 380px;
+    font-family: monospace;
+    font-size: 0.72rem;
+    color: var(--muted);
+    background: #0c1812;
+    border-radius: 10px;
+    padding: 10px;
+    height: 110px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+  }
+  .warning {
+    font-size: 0.78rem;
+    color: var(--muted);
+    text-align: center;
+    max-width: 380px;
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+
+  <h1>Hybrid Reverse Cache</h1>
+  <div class="subtitle">Phone Link &middot; Web Serial</div>
+
+  <div class="card">
+    <div class="status-row">
+      <div class="dot" id="statusDot"></div>
+      <span id="statusText">Not connected</span>
+    </div>
+
+    <button class="btn-primary" id="connectBtn">Connect to Device</button>
+    <button class="btn-secondary" id="sendLocationBtn" disabled>Send My Location</button>
+  </div>
+
+  <div class="card" id="resultCard" style="display:none;">
+    <div class="result" id="resultBox">
+      <div class="distance" id="resultDistance">--</div>
+      <div class="attempts" id="resultAttempts">-- attempts remaining</div>
+    </div>
+  </div>
+
+  <div class="log" id="log"></div>
+
+  <div class="warning">
+    Requires Chrome on Android with a data-capable USB cable. Location
+    permission is requested only when you tap "Send My Location".
+  </div>
+
+<script>
+// ============================================================================
+// STATE
+// ============================================================================
+let port = null;
+let reader = null;
+let writer = null;
+let lineBuffer = "";
+
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const connectBtn = document.getElementById('connectBtn');
+const sendLocationBtn = document.getElementById('sendLocationBtn');
+const resultCard = document.getElementById('resultCard');
+const resultBox = document.getElementById('resultBox');
+const resultDistance = document.getElementById('resultDistance');
+const resultAttempts = document.getElementById('resultAttempts');
+const logEl = document.getElementById('log');
+
+function log(msg) {
+  const time = new Date().toLocaleTimeString();
+  logEl.textContent += `[${time}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ============================================================================
+// WEB SERIAL CONNECTION
+// ============================================================================
+async function connect() {
+  if (!('serial' in navigator)) {
+    alert('Web Serial is not supported in this browser. Use Chrome on Android or Desktop.');
+    return;
+  }
+
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+
+    writer = port.writable.getWriter();
+
+    statusDot.classList.add('connected');
+    statusText.textContent = 'Connected';
+    connectBtn.textContent = 'Disconnect';
+    sendLocationBtn.disabled = false;
+
+    log('Connected to device.');
+    readLoop(); // start listening for incoming lines (fire and forget)
+  } catch (err) {
+    log('Connection failed: ' + err.message);
+  }
+}
+
+async function disconnect() {
+  try {
+    if (reader) {
+      await reader.cancel();
+      reader = null;
+    }
+    if (writer) {
+      writer.releaseLock();
+      writer = null;
+    }
+    if (port) {
+      await port.close();
+      port = null;
+    }
+  } catch (err) {
+    log('Error while disconnecting: ' + err.message);
+  }
+
+  statusDot.classList.remove('connected');
+  statusText.textContent = 'Not connected';
+  connectBtn.textContent = 'Connect to Device';
+  sendLocationBtn.disabled = true;
+}
+
+connectBtn.addEventListener('click', () => {
+  if (port) {
+    disconnect();
+  } else {
+    connect();
+  }
+});
+
+// ============================================================================
+// READ LOOP — parses newline-terminated messages from the ESP32
+// ============================================================================
+async function readLoop() {
+  const textDecoder = new TextDecoderStream();
+  const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+  reader = textDecoder.readable.getReader();
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        lineBuffer += value;
+        let newlineIdx;
+        while ((newlineIdx = lineBuffer.indexOf('\n')) >= 0) {
+          const line = lineBuffer.substring(0, newlineIdx).trim();
+          lineBuffer = lineBuffer.substring(newlineIdx + 1);
+          if (line.length > 0) handleIncomingLine(line);
+        }
+      }
+    }
+  } catch (err) {
+    log('Read loop ended: ' + err.message);
+  }
+}
+
+function handleIncomingLine(line) {
+  log('RX: ' + line);
+
+  if (line === 'READY') {
+    statusText.textContent = 'Connected - device ready';
+    return;
+  }
+
+  if (line === 'NOATTEMPTS') {
+    resultCard.style.display = 'block';
+    resultBox.classList.remove('nearby');
+    resultDistance.textContent = 'No attempts left';
+    resultAttempts.textContent = '0 attempts remaining';
+    return;
+  }
+
+  const parts = line.split(',');
+  if (parts[0] === 'DIST' || parts[0] === 'NEARBY') {
+    const meters = parseFloat(parts[1]);
+    const attemptsLeft = parts[2];
+
+    resultCard.style.display = 'block';
+
+    if (parts[0] === 'NEARBY') {
+      resultBox.classList.add('nearby');
+      resultDistance.textContent = 'TARGET NEARBY';
+    } else {
+      resultBox.classList.remove('nearby');
+      resultDistance.textContent = meters >= 1000
+        ? (meters / 1000).toFixed(2) + ' km'
+        : meters.toFixed(1) + ' m';
+    }
+
+    resultAttempts.textContent = attemptsLeft + ' attempt(s) remaining';
+  }
+}
+
+// ============================================================================
+// GEOLOCATION + SEND
+// ============================================================================
+async function sendLocation() {
+  if (!navigator.geolocation) {
+    alert('Geolocation is not supported on this device/browser.');
+    return;
+  }
+
+  sendLocationBtn.disabled = true;
+  sendLocationBtn.textContent = 'Getting location...';
+
+  navigator.geolocation.getCurrentPosition(
+    async (position) => {
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+      log(`GPS fix: ${lat.toFixed(6)}, ${lon.toFixed(6)}`);
+
+      const message = `GPS,${lat},${lon}\n`;
+      try {
+        const encoder = new TextEncoder();
+        await writer.write(encoder.encode(message));
+        log('TX: ' + message.trim());
+      } catch (err) {
+        log('Send failed: ' + err.message);
+      }
+
+      sendLocationBtn.disabled = false;
+      sendLocationBtn.textContent = 'Send My Location';
+    },
+    (err) => {
+      log('Geolocation error: ' + err.message);
+      alert('Could not get GPS location: ' + err.message);
+      sendLocationBtn.disabled = false;
+      sendLocationBtn.textContent = 'Send My Location';
+    },
+    {
+      enableHighAccuracy: true,
+      timeout: 15000,
+      maximumAge: 0
+    }
+  );
+}
+
+sendLocationBtn.addEventListener('click', sendLocation);
+</script>
+</body>
+</html>
